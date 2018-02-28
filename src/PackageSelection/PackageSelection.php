@@ -20,6 +20,11 @@ use Composer\Package\PackageInterface;
 use Composer\Repository\{ComposerRepository, ConfigurableRepositoryInterface, PlatformRepository, RepositoryInterface};
 use Composer\Semver\Constraint\MultiConstraint;
 use Symfony\Component\Console\Output\OutputInterface;
+use Amp\Parallel\Worker\Task;
+use Amp\Parallel\Worker\Environment;
+use Amp\Parallel\Worker\DefaultPool;
+use Amp\Loop;
+use Amp\Coroutine;
 
 /**
  * Builds the Packages list.
@@ -159,17 +164,40 @@ class PackageSelection
             $repos = $this->filterRepositories($repos);
         }
 
-        foreach ($repos as $repo) {
-            try {
-                $pool->addRepository($repo);
-            } catch (\Exception $exception) {
-                if (!$this->skipErrors) {
-                    throw $exception;
-                }
+        $packageSelection = $this;
 
-                $this->output->writeln(sprintf("<error>Skipping Exception '%s'.</error>", $exception->getMessage()));
+        // Event loop for parallel tasks
+        Loop::run(function () use (&$repos, $packageSelection, $pool) {
+            $workerPool = new DefaultPool();
+
+            $coroutines = [];
+            foreach ($repos as $repo) {
+                $coroutines[] = function () use ($workerPool, $pool, $repo) {
+                    $pool = yield $workerPool->enqueue(new AddRepoTask($pool, $repo));
+                };
             }
-        }
+
+            $coroutines = array_map(function (callable $coroutine) use ($packageSelection): Coroutine {
+                $coroutineObj = new Coroutine($coroutine());
+                $coroutineObj->onResolve(function(\Throwable $throwable = null, $value) use ($packageSelection) {
+                    if ($throwable) {
+                        if (!$packageSelection->skipErrors) {
+                            // XXX throwing is forbidden..
+                            throw $throwable;
+                        }
+
+                        $packageSelection->output->writeln(sprintf("<error>Skipping Exception '%s'.</error>", $throwable->getMessage()));
+                    } else {
+                        // everything went fine
+                    }
+                });
+                return $coroutineObj;
+            }, $coroutines);
+
+            yield \Amp\Promise\all($coroutines);
+
+            return yield $workerPool->shutdown();
+        });
 
         if ($this->hasRepositoryFilter()) {
             if (0 === count($repos)) {
